@@ -26,3 +26,6 @@ yarn-error.log*
 # keys
 *.keystore
 *.jks
+
+.vercel
+.env*
