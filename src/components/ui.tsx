@@ -209,3 +209,61 @@ export function EmptyState({
     </div>
   );
 }
+
+// ---------- Toast (transient feedback) ----------
+export type ToastTone = "success" | "error" | "info";
+export interface ToastItem {
+  id: string;
+  tone: ToastTone;
+  title: string;
+  message?: string;
+}
+
+const toastToneStyles: Record<ToastTone, string> = {
+  success: "border-accent-green/40 bg-accent-green/10 text-accent-green",
+  error: "border-accent-red/40 bg-accent-red/10 text-accent-red",
+  info: "border-accent-cyan/40 bg-accent-cyan/10 text-accent-cyan",
+};
+
+export function ToastStack({ toasts, onDismiss }: { toasts: ToastItem[]; onDismiss: (id: string) => void }) {
+  if (toasts.length === 0) return null;
+  return (
+    <div className="pointer-events-none fixed bottom-4 right-4 z-[60] flex w-full max-w-sm flex-col gap-2">
+      {toasts.map((t) => (
+        <div
+          key={t.id}
+          className={cn(
+            "pointer-events-auto flex items-start gap-2 rounded-lg border px-3 py-2 shadow-lg backdrop-blur animate-fadeIn",
+            toastToneStyles[t.tone]
+          )}
+        >
+          <div className="min-w-0 flex-1">
+            <p className="text-sm font-medium">{t.title}</p>
+            {t.message && <p className="mt-0.5 text-xs opacity-80 break-words">{t.message}</p>}
+          </div>
+          <button
+            onClick={() => onDismiss(t.id)}
+            className="shrink-0 opacity-60 hover:opacity-100"
+            aria-label="Dismiss"
+          >
+            ✕
+          </button>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// small hook to manage toasts from any component
+export function useToasts() {
+  const [toasts, setToasts] = React.useState<ToastItem[]>([]);
+  const push = React.useCallback((tone: ToastTone, title: string, message?: string, ttl = 4000) => {
+    const id = Math.random().toString(36).slice(2);
+    setToasts((prev) => [...prev, { id, tone, title, message }]);
+    if (ttl > 0) setTimeout(() => dismiss(id), ttl);
+  }, []);
+  const dismiss = React.useCallback((id: string) => {
+    setToasts((prev) => prev.filter((t) => t.id !== id));
+  }, []);
+  return { toasts, push, dismiss };
+}

@@ -1,6 +1,7 @@
 "use client";
 
-import { useEffect, useState, useCallback, useRef } from "react";
+import { useEffect, useState, useCallback } from "react";
+import { useRouter } from "next/navigation";
 import {
   ArrowLeft,
   Smartphone,
@@ -30,8 +31,6 @@ import {
   CheckCircle2,
   XCircle,
   Clock,
-  Image as ImageIcon,
-  ExternalLink,
   MemoryStick,
   LayoutGrid,
   MonitorSmartphone,
@@ -40,12 +39,23 @@ import {
   Video,
   MonitorPlay,
   ClipboardList,
+  AlertTriangle,
 } from "lucide-react";
 import Link from "next/link";
-import { Button, Card, CardHeader, CardBody, Badge, StatusDot, EmptyState } from "@/components/ui";
+import {
+  Button,
+  Card,
+  CardHeader,
+  CardBody,
+  Badge,
+  StatusDot,
+  EmptyState,
+  ToastStack,
+  useToasts,
+} from "@/components/ui";
 import { actionsByCategory } from "@/lib/catalog";
 import { timeAgo, fmtDate, cn } from "@/lib/utils";
-import type { Device, CommandResult, DeviceTelemetry } from "@/lib/types";
+import type { Device, CommandResult } from "@/lib/types";
 
 const ICONS: Record<string, any> = {
   Smartphone, BatteryCharging, HardDrive, Wifi, MapPin, Activity, Camera, Mic,
@@ -57,21 +67,46 @@ const ICONS: Record<string, any> = {
 type Tab = "info" | "action" | "media" | "history" | "telemetry";
 
 export default function DeviceConsole({ deviceId }: { deviceId: string }) {
+  const router = useRouter();
   const [device, setDevice] = useState<Device | null>(null);
   const [results, setResults] = useState<CommandResult[]>([]);
   const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [tab, setTab] = useState<Tab>("info");
   const [busy, setBusy] = useState<string | null>(null);
-  const [lastResult, setLastResult] = useState<CommandResult | null>(null);
-  const polling = useRef(false);
+  const { toasts, push: pushToast, dismiss } = useToasts();
 
+  // ---- safe loader (never throws; handles non-JSON, 401, network) ----
   const load = useCallback(async () => {
-    const res = await fetch(`/api/devices/${deviceId}`);
-    const j = await res.json();
-    if (j?.data?.device) setDevice(j.data.device);
-    if (j?.data?.results) setResults(j.data.results);
-    setLoading(false);
-  }, [deviceId]);
+    try {
+      const res = await fetch(`/api/devices/${deviceId}`, { cache: "no-store" });
+      if (res.status === 401) {
+        router.replace("/login");
+        return;
+      }
+      if (!res.ok) {
+        setLoadError(`Server returned ${res.status}`);
+        setLoading(false);
+        return;
+      }
+      const text = await res.text();
+      let j: any;
+      try {
+        j = JSON.parse(text);
+      } catch {
+        setLoadError("Received an invalid response from the server.");
+        setLoading(false);
+        return;
+      }
+      if (j?.data?.device) setDevice(j.data.device);
+      if (Array.isArray(j?.data?.results)) setResults(j.data.results);
+      setLoadError(null);
+      setLoading(false);
+    } catch (e: any) {
+      setLoadError(e?.message || "Network error while loading device.");
+      setLoading(false);
+    }
+  }, [deviceId, router]);
 
   useEffect(() => {
     load();
@@ -79,48 +114,59 @@ export default function DeviceConsole({ deviceId }: { deviceId: string }) {
     return () => clearInterval(t);
   }, [load]);
 
+  // ---- send a command and watch for its result by command_id ----
   async function sendCommand(action: string, payload: Record<string, unknown> = {}) {
+    const label = humanAction(action);
     setBusy(action);
-    setLastResult(null);
-    const res = await fetch(`/api/devices/${deviceId}/commands`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ action, payload }),
-    });
-    const j = await res.json();
-    setBusy(null);
-    if (!res.ok) {
-      setLastResult({
-        command_id: "err",
-        device_id: deviceId,
-        action,
-        status: "error",
-        error: j?.error || "Failed to queue",
-        created_at: Date.now(),
+    pushToast("info", `${label}`, "Command queued — waiting for device…", 3000);
+
+    let commandId: string | null = null;
+    try {
+      const res = await fetch(`/api/devices/${deviceId}/commands`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action, payload }),
       });
+      const j = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        const msg = j?.error || `Failed to queue (${res.status})`;
+        pushToast("error", `${label} failed`, msg);
+        setBusy(null);
+        return;
+      }
+      commandId = j?.data?.command?.command_id ?? null;
+    } catch (e: any) {
+      pushToast("error", `${label} failed`, e?.message || "Network error");
+      setBusy(null);
       return;
     }
-    // wait for the device to post a result (poll a few times)
-    setBusy(action);
-    for (let i = 0; i < 10; i++) {
-      await new Promise((r) => setTimeout(r, 1500));
-      await load();
-      const found = resultsRef.current.find(
-        (r) => r.action === action && Date.now() - r.completed_at! < 30000
-      );
-      if (found) {
-        setLastResult(found);
-        break;
+
+    // poll for the matching result by command_id (no stale closure)
+    if (commandId) {
+      const deadline = Date.now() + 35000;
+      while (Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 1500));
+        await load();
+        const found = results.find(
+          (r) => r.command_id === commandId
+        );
+        if (found) {
+          if (found.status === "success") {
+            pushToast("success", `${label} succeeded`, undefined, 4000);
+          } else {
+            pushToast(
+              "error",
+              `${label} ${found.status}`,
+              found.error || undefined,
+              6000
+            );
+          }
+          break;
+        }
       }
     }
     setBusy(null);
   }
-
-  // keep a ref of results to read inside the polling loop
-  const resultsRef = useRef<CommandResult[]>([]);
-  useEffect(() => {
-    resultsRef.current = results;
-  }, [results]);
 
   if (loading) {
     return (
@@ -129,6 +175,27 @@ export default function DeviceConsole({ deviceId }: { deviceId: string }) {
       </div>
     );
   }
+
+  if (loadError && !device) {
+    return (
+      <EmptyState
+        icon={<AlertTriangle className="h-10 w-10" />}
+        title="Couldn't load this device"
+        description={loadError}
+        action={
+          <div className="flex gap-2">
+            <Button variant="primary" onClick={load}>
+              <RefreshCw className="h-4 w-4" /> Retry
+            </Button>
+            <Link href="/dashboard">
+              <Button variant="outline">Back to fleet</Button>
+            </Link>
+          </div>
+        }
+      />
+    );
+  }
+
   if (!device) {
     return (
       <EmptyState
@@ -151,8 +218,12 @@ export default function DeviceConsole({ deviceId }: { deviceId: string }) {
     { id: "history", label: "Command History" },
   ];
 
+  const isOffline = device.status !== "online";
+
   return (
     <div className="space-y-5">
+      <ToastStack toasts={toasts} onDismiss={dismiss} />
+
       {/* header */}
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div className="flex items-center gap-3">
@@ -177,6 +248,14 @@ export default function DeviceConsole({ deviceId }: { deviceId: string }) {
         </Button>
       </div>
 
+      {/* offline banner */}
+      {isOffline && (
+        <div className="flex items-center gap-2 rounded-lg border border-accent-amber/30 bg-accent-amber/10 px-3 py-2 text-xs text-accent-amber">
+          <AlertTriangle className="h-4 w-4 shrink-0" />
+          Device is offline. Commands will be queued and run when it reconnects.
+        </div>
+      )}
+
       {/* quick telemetry strip */}
       <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
         <MiniStat icon={BatteryCharging} label="Battery"
@@ -188,33 +267,6 @@ export default function DeviceConsole({ deviceId }: { deviceId: string }) {
         <MiniStat icon={Clock} label="Last Seen"
           value={device.last_seen ? timeAgo(device.last_seen) : "never"} />
       </div>
-
-      {/* last command result toast */}
-      {lastResult && (
-        <Card className={cn(
-          "p-3",
-          lastResult.status === "success" ? "border-accent-green/30" : "border-accent-red/30"
-        )}>
-          <div className="flex items-center gap-2 text-sm">
-            {lastResult.status === "success" ? (
-              <CheckCircle2 className="h-4 w-4 text-accent-green" />
-            ) : (
-              <XCircle className="h-4 w-4 text-accent-red" />
-            )}
-            <span className="font-medium text-white">{lastResult.action}</span>
-            <span className="text-gray-500">—</span>
-            <span className={lastResult.status === "success" ? "text-accent-green" : "text-accent-red"}>
-              {lastResult.status}
-            </span>
-            {lastResult.error && <span className="text-gray-400">· {lastResult.error}</span>}
-            {lastResult.data && (
-              <pre className="ml-auto max-w-md overflow-auto rounded bg-bg-base px-2 py-1 font-mono text-xs text-gray-300">
-                {JSON.stringify(lastResult.data).slice(0, 200)}
-              </pre>
-            )}
-          </div>
-        </Card>
-      )}
 
       {/* tabs */}
       <div className="flex flex-wrap gap-1 border-b border-border">
@@ -237,7 +289,7 @@ export default function DeviceConsole({ deviceId }: { deviceId: string }) {
       {/* tab content */}
       {tab === "info" && <InfoTab device={device} send={sendCommand} busy={busy} />}
       {tab === "action" && <ActionTab send={sendCommand} busy={busy} />}
-      {tab === "media" && <MediaTab device={device} send={sendCommand} busy={busy} results={results} />}
+      {tab === "media" && <MediaTab send={sendCommand} busy={busy} results={results} />}
       {tab === "telemetry" && <TelemetryTab device={device} />}
       {tab === "history" && <HistoryTab results={results} />}
     </div>
@@ -272,7 +324,7 @@ function InfoTab({ device, send, busy }: { device: Device; send: (a: string) => 
         <CardBody>
           {info.length === 0 ? (
             <p className="text-sm text-gray-500">
-              No info yet. The device will report this on first heartbeat, or tap refresh.
+              No info yet. The device reports this on first heartbeat, or tap refresh.
             </p>
           ) : (
             <dl className="grid grid-cols-1 gap-x-6 gap-y-2 sm:grid-cols-2">
@@ -322,14 +374,18 @@ function ActionTab({ send, busy }: { send: (a: string, p?: any) => void; busy: s
 }
 
 // ----------------- Media tab -----------------
-function MediaTab({ device, send, busy, results }: {
-  device: Device; send: (a: string, p?: any) => void; busy: string | null; results: CommandResult[];
+function MediaTab({ send, busy, results }: {
+  send: (a: string, p?: any) => void; busy: string | null; results: CommandResult[];
 }) {
   const actions = actionsByCategory("media");
-  // find latest media url in results
+  // find latest media url in results (guard against missing data)
   const lastMedia = [...results].reverse().find(
-    (r) => r.status === "success" && (r.data?.image_url || r.data?.audio_url || r.data?.screenshot_url)
+    (r) => r.status === "success" && r.data && (r.data.image_url || r.data.audio_url || r.data.screenshot_url || r.data.image_base64 || r.data.audio_base64)
   );
+  const imgUrl = lastMedia?.data?.image_url || lastMedia?.data?.screenshot_url || lastMedia?.data?.image_base64;
+  const audioUrl = lastMedia?.data?.audio_url || lastMedia?.data?.audio_base64;
+  const mediaTs = lastMedia?.completed_at ?? lastMedia?.created_at ?? Date.now();
+
   return (
     <div className="grid gap-4 lg:grid-cols-3">
       <Card className="lg:col-span-2">
@@ -352,14 +408,14 @@ function MediaTab({ device, send, busy, results }: {
         <CardBody>
           {lastMedia ? (
             <div className="space-y-2">
-              {!!lastMedia.data?.image_url && (
+              {!!imgUrl && (
                 // eslint-disable-next-line @next/next/no-img-element
-                <img src={lastMedia.data.image_url as string} alt="capture" className="w-full rounded-lg border border-border" />
+                <img src={imgUrl as string} alt="capture" className="w-full rounded-lg border border-border" />
               )}
-              {!!lastMedia.data?.audio_url && (
-                <audio controls src={lastMedia.data.audio_url as string} className="w-full" />
+              {!!audioUrl && (
+                <audio controls src={audioUrl as string} className="w-full" />
               )}
-              <p className="text-xs text-gray-500">{lastMedia.action} · {timeAgo(lastMedia.completed_at!)}</p>
+              <p className="text-xs text-gray-500">{lastMedia.action} · {timeAgo(mediaTs)}</p>
             </div>
           ) : (
             <p className="text-sm text-gray-500">No media captured yet.</p>
@@ -372,7 +428,7 @@ function MediaTab({ device, send, busy, results }: {
 
 // ----------------- Telemetry tab -----------------
 function TelemetryTab({ device }: { device: Device }) {
-  const hist = device.telemetry_history || [];
+  const hist = Array.isArray(device.telemetry_history) ? device.telemetry_history : [];
   return (
     <Card>
       <CardHeader><h3 className="font-semibold text-white">Telemetry</h3></CardHeader>
@@ -381,9 +437,9 @@ function TelemetryTab({ device }: { device: Device }) {
           <p className="text-sm text-gray-500">No telemetry yet. It appears as the device sends heartbeats.</p>
         ) : (
           <div className="space-y-4">
-            <SimpleChart title="Battery %" data={hist.map((t) => t.battery_level).filter((x) => typeof x === "number") as number[]} tone="#22c55e" />
-            <SimpleChart title="Free Storage (GB)" data={hist.map((t) => t.free_storage_mb ? +(t.free_storage_mb / 1024).toFixed(2) : undefined).filter((x) => typeof x === "number") as number[]} tone="#00f0ff" />
-            <SimpleChart title="Free RAM (GB)" data={hist.map((t) => t.free_memory_mb ? +(t.free_memory_mb / 1024).toFixed(2) : undefined).filter((x) => typeof x === "number") as number[]} tone="#a855f7" />
+            <SimpleChart title="Battery %" data={hist.map((t) => t.battery_level).filter((x): x is number => typeof x === "number")} tone="#22c55e" />
+            <SimpleChart title="Free Storage (GB)" data={hist.map((t) => (typeof t.free_storage_mb === "number" ? +(t.free_storage_mb / 1024).toFixed(2) : undefined)).filter((x): x is number => typeof x === "number")} tone="#00f0ff" />
+            <SimpleChart title="Free RAM (GB)" data={hist.map((t) => (typeof t.free_memory_mb === "number" ? +(t.free_memory_mb / 1024).toFixed(2) : undefined)).filter((x): x is number => typeof x === "number")} tone="#a855f7" />
           </div>
         )}
       </CardBody>
@@ -492,6 +548,14 @@ function CommandRow({ icon: Icon, label, desc, running, onClick }: {
       </Button>
     </div>
   );
+}
+
+// human-readable label for an action string
+function humanAction(action: string): string {
+  return action
+    .split(/[._]/)
+    .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+    .join(" ");
 }
 
 // default payloads for commands that need params
